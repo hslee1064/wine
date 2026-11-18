@@ -3093,6 +3093,50 @@ static FT_Int get_load_flags( UINT format )
 }
 
 /*************************************************************
+ * get_color_glyph_bitmap
+ *
+ * Render a color (e.g. COLR/CPAL emoji) glyph as a top-down premultiplied
+ * BGRA bitmap. Fails for fonts without color glyphs or with transformations
+ * so that callers can fall back to the regular monochrome rendering.
+ */
+static UINT get_color_glyph_bitmap( struct gdi_font *font, UINT glyph, GLYPHMETRICS *gm,
+                                    UINT buflen, void *buf, const FT_Matrix *matrices )
+{
+    FT_Face ft_face = get_ft_face( font );
+    FT_GlyphSlot slot = ft_face->glyph;
+    FT_Bitmap *bitmap = &slot->bitmap;
+    UINT y, needed;
+
+    /* color glyphs are drawn as-is even for synthesized bold: emboldening
+     * doesn't apply to them, and the outline fallback of a COLR glyph is empty */
+    if (!FT_HAS_COLOR( ft_face ) || matrices) return GDI_ERROR;
+
+    if (pFT_Load_Glyph( ft_face, glyph, FT_LOAD_COLOR | FT_LOAD_NO_HINTING )) return GDI_ERROR;
+    if (slot->format != FT_GLYPH_FORMAT_BITMAP &&
+        pFT_Render_Glyph( slot, FT_RENDER_MODE_NORMAL )) return GDI_ERROR;
+    if (bitmap->pixel_mode != FT_PIXEL_MODE_BGRA) return GDI_ERROR;
+
+    memset( gm, 0, sizeof(*gm) );
+    gm->gmBlackBoxX = bitmap->width;
+    gm->gmBlackBoxY = bitmap->rows;
+    gm->gmptGlyphOrigin.x = slot->bitmap_left;
+    gm->gmptGlyphOrigin.y = slot->bitmap_top;
+    gm->gmCellIncX = (slot->advance.x + 32) >> 6;
+
+    needed = bitmap->width * bitmap->rows * 4;
+    if (!buf || !buflen) return needed;
+    if (needed > buflen) return GDI_ERROR;
+
+    for (y = 0; y < bitmap->rows; y++)
+    {
+        const BYTE *src = bitmap->pitch >= 0 ? bitmap->buffer + y * bitmap->pitch
+                                             : bitmap->buffer + (bitmap->rows - 1 - y) * -bitmap->pitch;
+        memcpy( (BYTE *)buf + y * bitmap->width * 4, src, bitmap->width * 4 );
+    }
+    return needed;
+}
+
+/*************************************************************
  * freetype_get_glyph_outline
  */
 static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT format,
@@ -3117,6 +3161,9 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
     format &= ~GGO_UNHINTED;
 
     matrices = get_transform_matrices( font, tategaki, lpmat, transform_matrices );
+
+    if (format == WINE_GGO_BGRA_BITMAP)
+        return tategaki ? GDI_ERROR : get_color_glyph_bitmap( font, glyph, lpgm, buflen, buf, matrices );
 
     vertical_metrics = (tategaki && FT_HAS_VERTICAL(ft_face));
 

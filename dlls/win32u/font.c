@@ -4252,6 +4252,16 @@ static BOOL font_GetTextExtentExPoint( PHYSDEV dev, const WCHAR *str, INT count,
     pthread_mutex_lock( &font_lock );
     for (i = pos = 0; i < count; i++)
     {
+        if (IS_HIGH_SURROGATE( str[i] ) && i + 1 < count && IS_LOW_SURROGATE( str[i + 1] ))
+        {
+            /* measure the pair as a single supplementary-plane character */
+            UINT ch = 0x10000 + ((str[i] - 0xd800) << 10) + (str[i + 1] - 0xdc00);
+            get_glyph_outline( physdev->font, ch, GGO_METRICS, NULL, &abc, 0, NULL, NULL );
+            pos += abc.abcA + abc.abcB + abc.abcC;
+            dxs[i] = pos;
+            dxs[++i] = pos;  /* low surrogate has no advance of its own */
+            continue;
+        }
         get_glyph_outline( physdev->font, str[i], GGO_METRICS, NULL, &abc, 0, NULL, NULL );
         pos += abc.abcA + abc.abcB + abc.abcC;
         dxs[i] = pos;

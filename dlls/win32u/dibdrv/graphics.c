@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include "ntgdi_private.h"
 #include "dibdrv.h"
+#include "winnls.h"
 
 #include "wine/debug.h"
 
@@ -34,6 +35,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(dib);
 struct cached_glyph
 {
     GLYPHMETRICS metrics;
+    BOOL         color;   /* bits are a premultiplied 32-bpp BGRA bitmap */
     BYTE         bits[1];
 };
 
@@ -45,7 +47,7 @@ enum glyph_type
 };
 
 #define GLYPH_CACHE_PAGE_SIZE  0x100
-#define GLYPH_CACHE_PAGES      (0x10000 / GLYPH_CACHE_PAGE_SIZE)
+#define GLYPH_CACHE_PAGES      (0x110000 / GLYPH_CACHE_PAGE_SIZE)  /* full Unicode range */
 
 struct cached_font
 {
@@ -710,6 +712,38 @@ static void draw_glyph( dib_info *dib, int x, int y, const GLYPHMETRICS *metrics
     }
 }
 
+static void draw_color_glyph( dib_info *dib, int x, int y, const struct cached_glyph *glyph,
+                              const struct clipped_rects *clipped_rects, RECT *bounds )
+{
+    static const BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    const GLYPHMETRICS *metrics = &glyph->metrics;
+    dib_info glyph_dib;
+    RECT rect, clipped_rect;
+    POINT offset;
+    int i;
+
+    rect.left   = x          + metrics->gmptGlyphOrigin.x;
+    rect.top    = y          - metrics->gmptGlyphOrigin.y;
+    rect.right  = rect.left  + metrics->gmBlackBoxX;
+    rect.bottom = rect.top   + metrics->gmBlackBoxY;
+    if (bounds) add_bounds_rect( bounds, &rect );
+
+    memset( &glyph_dib, 0, sizeof(glyph_dib) );
+    glyph_dib.bit_count   = 32;
+    glyph_dib.width       = metrics->gmBlackBoxX;
+    glyph_dib.height      = metrics->gmBlackBoxY;
+    glyph_dib.rect.right  = metrics->gmBlackBoxX;
+    glyph_dib.rect.bottom = metrics->gmBlackBoxY;
+    glyph_dib.stride      = metrics->gmBlackBoxX * 4;
+    glyph_dib.bits.ptr    = (void *)glyph->bits;
+    offset.x = -rect.left;
+    offset.y = -rect.top;
+
+    for (i = 0; i < clipped_rects->count; i++)
+        if (intersect_rect( &clipped_rect, &rect, clipped_rects->rects + i ))
+            dib->funcs->blend_rects( dib, 1, &clipped_rect, &glyph_dib, &offset, blend );
+}
+
 static int get_glyph_depth( UINT aa_flags )
 {
     switch (aa_flags)
@@ -742,6 +776,14 @@ static const int padding[4] = {0, 3, 2, 1};
  * For non-antialiased bitmaps convert them to the 17-level format
  * using only values 0 or 16.
  */
+/* like NtGdiGetGlyphOutline, but without truncating supplementary-plane characters */
+static DWORD get_glyph_outline( DC *dc, UINT ch, UINT format, GLYPHMETRICS *metrics,
+                                DWORD size, void *buffer, const MAT2 *mat )
+{
+    PHYSDEV dev = GET_DC_PHYSDEV( dc, pGetGlyphOutline );
+    return dev->funcs->pGetGlyphOutline( dev, ch, format, metrics, size, buffer, mat );
+}
+
 static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font, UINT index, UINT flags )
 {
     UINT ggo_flags = font->aa_flags;
@@ -755,12 +797,27 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
     struct cached_glyph *glyph;
 
     if (flags & ETO_GLYPH_INDEX) ggo_flags |= GGO_GLYPH_INDEX;
+
+    /* prefer a color glyph (e.g. emoji) when the font provides one */
+    ret = get_glyph_outline( dc, index, WINE_GGO_BGRA_BITMAP | (ggo_flags & GGO_GLYPH_INDEX),
+                             &metrics, 0, NULL, &identity );
+    if (ret != GDI_ERROR && ret && (glyph = malloc( FIELD_OFFSET( struct cached_glyph, bits[ret] ))))
+    {
+        if (get_glyph_outline( dc, index, WINE_GGO_BGRA_BITMAP | (ggo_flags & GGO_GLYPH_INDEX),
+                               &metrics, ret, glyph->bits, &identity ) != GDI_ERROR)
+        {
+            glyph->metrics = metrics;
+            glyph->color = TRUE;
+            return add_cached_glyph( font, index, flags, glyph );
+        }
+        free( glyph );
+    }
+
     indices[0] = index;
     for (i = 0; i < ARRAY_SIZE( indices ); i++)
     {
         index = indices[i];
-        ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, 0, NULL,
-                                    &identity, FALSE );
+        ret = get_glyph_outline( dc, index, ggo_flags, &metrics, 0, NULL, &identity );
         if (ret != GDI_ERROR) break;
     }
     if (ret == GDI_ERROR) return NULL;
@@ -775,8 +832,7 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
 
     if (bit_count == 8) pad = padding[ metrics.gmBlackBoxX % 4 ];
 
-    ret = NtGdiGetGlyphOutline( dc->hSelf, index, ggo_flags, &metrics, size, glyph->bits,
-                                &identity, FALSE );
+    ret = get_glyph_outline( dc, index, ggo_flags, &metrics, size, glyph->bits, &identity );
     if (ret == GDI_ERROR)
     {
         free( glyph );
@@ -804,6 +860,7 @@ static struct cached_glyph *cache_glyph_bitmap( DC *dc, struct cached_font *font
 
 done:
     glyph->metrics = metrics;
+    glyph->color = FALSE;
     return add_cached_glyph( font, index, flags, glyph );
 }
 
@@ -832,27 +889,47 @@ static void render_string( DC *dc, dib_info *dib, struct cached_font *font, INT 
 
     for (i = 0; i < count; i++)
     {
-        if (!(glyph = get_cached_glyph( font, str[i], flags )) &&
-            !(glyph = cache_glyph_bitmap( dc, font, str[i], flags ))) continue;
+        UINT ch = str[i], first = i;
 
-        glyph_dib.width       = glyph->metrics.gmBlackBoxX;
-        glyph_dib.height      = glyph->metrics.gmBlackBoxY;
-        glyph_dib.rect.right  = glyph->metrics.gmBlackBoxX;
-        glyph_dib.rect.bottom = glyph->metrics.gmBlackBoxY;
-        glyph_dib.stride      = get_dib_stride( glyph->metrics.gmBlackBoxX, glyph_dib.bit_count );
-        glyph_dib.bits.ptr    = glyph->bits;
+        /* render a surrogate pair as a single supplementary-plane character */
+        if (!(flags & ETO_GLYPH_INDEX) && IS_HIGH_SURROGATE( str[i] ) &&
+            i + 1 < count && IS_LOW_SURROGATE( str[i + 1] ))
+            ch = 0x10000 + ((str[i] - 0xd800) << 10) + (str[++i] - 0xdc00);
 
-        draw_glyph( dib, x, y, &glyph->metrics, &glyph_dib, text_color, &intensity, clipped_rects, bounds );
+        if ((glyph = get_cached_glyph( font, ch, flags )) ||
+            (glyph = cache_glyph_bitmap( dc, font, ch, flags )))
+        {
+            if (glyph->color)
+            {
+                draw_color_glyph( dib, x, y, glyph, clipped_rects, bounds );
+                goto advance;
+            }
+            glyph_dib.width       = glyph->metrics.gmBlackBoxX;
+            glyph_dib.height      = glyph->metrics.gmBlackBoxY;
+            glyph_dib.rect.right  = glyph->metrics.gmBlackBoxX;
+            glyph_dib.rect.bottom = glyph->metrics.gmBlackBoxY;
+            glyph_dib.stride      = get_dib_stride( glyph->metrics.gmBlackBoxX, glyph_dib.bit_count );
+            glyph_dib.bits.ptr    = glyph->bits;
 
+            draw_glyph( dib, x, y, &glyph->metrics, &glyph_dib, text_color, &intensity, clipped_rects, bounds );
+        }
+        else continue;
+
+    advance:
         if (dx)
         {
-            if (flags & ETO_PDY)
+            UINT j;
+
+            for (j = first; j <= i; j++)
             {
-                x += dx[ i * 2 ];
-                y += dx[ i * 2 + 1];
+                if (flags & ETO_PDY)
+                {
+                    x += dx[ j * 2 ];
+                    y += dx[ j * 2 + 1];
+                }
+                else
+                    x += dx[ j ];
             }
-            else
-                x += dx[ i ];
         }
         else
         {

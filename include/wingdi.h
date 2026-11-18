@@ -1347,6 +1347,7 @@ typedef struct
 #define WINE_GGO_HBGR_BITMAP   0x12
 #define WINE_GGO_VRGB_BITMAP   0x13
 #define WINE_GGO_VBGR_BITMAP   0x14
+#define WINE_GGO_BGRA_BITMAP   0x15  /* premultiplied 32-bpp color glyph (COLR/CPAL fonts) */
 #endif
 
 typedef struct
