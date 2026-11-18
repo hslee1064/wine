@@ -368,6 +368,61 @@ static void test_IEnumWbemClassObject_Next( IWbemServices *services )
     SysFreeString( wql );
 }
 
+static const WCHAR *get_ip_type(const WCHAR *ip)
+{
+    const WCHAR *dot_pos;
+    const WCHAR *colon_pos;
+
+    if (!ip) return L"Invalid";
+
+    dot_pos = wcschr(ip, L'.');
+    colon_pos = wcschr(ip, L':');
+
+    if (dot_pos && colon_pos) return L"Unknown";
+    if (dot_pos) return L"IPv4";
+    else if (colon_pos) return L"IPv6";
+
+    return L"Unknown";
+}
+
+static void check_ip_address_order( ULONG line, IWbemClassObject *obj )
+{
+    CIMTYPE type = 0xdeadbeef;
+    VARIANT val;
+    HRESULT hr;
+
+    VariantInit( &val );
+    hr = IWbemClassObject_Get( obj, L"IPAddress", 0, &val, &type, NULL );
+    if (hr != S_OK)
+    {
+        win_skip( "IPAddress not available\n" );
+        VariantClear( &val );
+        return;
+    }
+
+    if (V_VT( &val ) == (VT_BSTR | VT_ARRAY))
+    {
+        SAFEARRAY *sa;
+        LONG bound = -1, j;
+        BSTR ip_str;
+        sa = V_ARRAY( &val );
+        SafeArrayGetUBound( sa, 1, &bound );
+        if (bound >= 0)
+        {
+            trace( "%s\n", wine_dbgstr_w(L"IPAddress:") );
+            for (j = 0; j <= bound; j++)
+            {
+                SafeArrayGetElement( sa, &j, &ip_str );
+                trace( "[%02lu]: %s\n", j + 1, wine_dbgstr_w(ip_str) );
+                if (j == 0) ok( wcscmp(L"IPv4", get_ip_type(ip_str)) == 0, "%lu: unexpected ip address order %s\n", line, wine_dbgstr_w(ip_str) );
+                SysFreeString( ip_str );
+            }
+        }
+    }
+
+    VariantClear( &val );
+}
+
 static void _check_property( ULONG line, IWbemClassObject *obj, const WCHAR *prop, VARTYPE vartype, CIMTYPE cimtype,
                              BOOL nullable)
 {
@@ -405,12 +460,13 @@ static void _check_property( ULONG line, IWbemClassObject *obj, const WCHAR *pro
 }
 #define check_property(a,b,c,d) _check_property(__LINE__,a,b,c,d,FALSE)
 #define check_property_nullable(a,b,c,d) _check_property(__LINE__,a,b,c,d,TRUE)
+#define check_ip_address_order(a) check_ip_address_order(__LINE__,a)
 
 static void test_Win32_Service( IWbemServices *services )
 {
-    BSTR class = SysAllocString( L"Win32_Service.Name=\"Spooler\"" ), empty = SysAllocString( L"" ), method;
-    IWbemClassObject *service, *out;
-    VARIANT state, retval, classvar;
+    BSTR class = SysAllocString( L"Win32_Service.Name=\"Spooler\"" ), empty = SysAllocString( L"" ), method, path;
+    IWbemClassObject *service, *out, *in, *sig_in, *sig_out;
+    VARIANT state, retval, classvar, var;
     CIMTYPE type;
     HRESULT hr;
 
@@ -423,7 +479,11 @@ static void test_Win32_Service( IWbemServices *services )
         return;
     }
 
+    check_property( service, L"Description", VT_BSTR, CIM_STRING );
     check_property( service, L"ProcessID", VT_I4, CIM_UINT32 );
+    check_property( service, L"PathName", VT_BSTR, CIM_STRING );
+    check_property( service, L"StartName", VT_BSTR, CIM_STRING );
+
     type = 0xdeadbeef;
     VariantInit( &state );
     hr = IWbemClassObject_Get( service, L"State", 0, &state, &type, NULL );
@@ -514,6 +574,56 @@ static void test_Win32_Service( IWbemServices *services )
     ok( hr == WBEM_E_NOT_FOUND, "got %#lx\n", hr );
     ok( service == NULL, "expected NULL service, got %p\n", service );
     SysFreeString( class );
+
+    class = SysAllocString( L"Win32_Service" );
+    hr = IWbemServices_GetObject( services, class, 0, NULL, &service, NULL );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    SysFreeString( class );
+
+    hr = IWbemClassObject_GetMethod( service, L"ChangeStartMode", 0, &sig_in, &sig_out );
+    ok( hr == S_OK, "got %#lx\n", hr );
+
+    hr = IWbemClassObject_SpawnInstance( sig_in, 0, &in );
+    ok( hr == S_OK, "got %#lx\n", hr );
+
+    V_VT( &var ) = VT_BSTR;
+    V_BSTR( &var ) = SysAllocString( L"Manual" );
+    hr = IWbemClassObject_Put( in, L"StartMode", 0, &var, 0 );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    VariantClear( &var );
+
+    path = SysAllocString( L"Win32_Service.Name=\"Spooler\"" );
+    method = SysAllocString( L"ChangeStartMode" );
+    out = NULL;
+    hr = IWbemServices_ExecMethod( services, path, method, 0, NULL, in, &out, NULL );
+    ok( hr == S_OK, "got %#lx\n", hr );
+
+    VariantInit( &retval );
+    hr = IWbemClassObject_Get( out, L"ReturnValue", 0, &retval, NULL, NULL );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    ok( !V_I4(&retval) || V_I4(&retval) == 2, "got %ld\n", V_I4(&retval) );
+
+    V_VT( &var ) = VT_BSTR;
+    V_BSTR( &var ) = SysAllocString( L"Auto" );
+    hr = IWbemClassObject_Put( in, L"StartMode", 0, &var, 0 );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    VariantClear( &var );
+
+    out = NULL;
+    hr = IWbemServices_ExecMethod( services, path, method, 0, NULL, in, &out, NULL );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    SysFreeString( method );
+    SysFreeString( path );
+
+    VariantInit( &retval );
+    hr = IWbemClassObject_Get( out, L"ReturnValue", 0, &retval, NULL, NULL );
+    ok( hr == S_OK, "got %#lx\n", hr );
+    ok( V_I4(&retval) == 21, "got %ld\n", V_I4(&retval) );
+
+    IWbemClassObject_Release( out );
+    IWbemClassObject_Release( sig_in );
+    IWbemClassObject_Release( sig_out );
+    IWbemClassObject_Release( service );
 }
 
 static void test_Win32_Bios( IWbemServices *services )
@@ -750,6 +860,26 @@ static void test_Win32_Process( IWbemServices *services, BOOL use_full_path )
     refcount = IWbemClassObject_Release( sig_out );
     ok( !refcount, "got unexpected refcount %lu\n", refcount );
 
+    out = NULL;
+    method = SysAllocString( L"GetOwnerSid" );
+    class = SysAllocStringLen( NULL, full_path_len + ARRAY_SIZE( L"Win32_Process.Handle=\"%u\"" ) + 10 );
+    memcpy( class, full_path, full_path_len * sizeof(WCHAR) );
+    wsprintfW( class + full_path_len, L"Win32_Process.Handle=\"%u\"", GetCurrentProcessId() );
+    hr = IWbemServices_ExecMethod( services, class, method, 0, NULL, NULL, &out, NULL );
+    ok( hr == S_OK, "failed to execute method %#lx\n", hr );
+    SysFreeString( method );
+
+    type = 0xdeadbeef;
+    VariantInit( &retval );
+    hr = IWbemClassObject_Get( out, L"ReturnValue", 0, &retval, &type, NULL );
+    ok( hr == S_OK, "failed to get return value %#lx\n", hr );
+    ok( V_VT( &retval ) == VT_I4, "unexpected variant type 0x%x\n", V_VT( &retval ) );
+    ok( !V_I4( &retval ), "unexpected error %ld\n", V_I4( &retval ) );
+    ok( type == CIM_UINT32, "unexpected type %#lx\n", type );
+
+    check_property( out, L"Sid", VT_BSTR, CIM_STRING );
+    IWbemClassObject_Release( out );
+
     sig_in = (void*)0xdeadbeef;
     hr = IWbemClassObject_GetMethod( process, L"getowner", 0, &sig_in, NULL );
     ok( hr == S_OK, "failed to get GetOwner method %#lx\n", hr );
@@ -758,7 +888,6 @@ static void test_Win32_Process( IWbemServices *services, BOOL use_full_path )
 
     out = NULL;
     method = SysAllocString( L"GetOwner" );
-    class = SysAllocStringLen( NULL, full_path_len + ARRAY_SIZE( L"Win32_Process.Handle=\"%u\"" ) + 10 );
     memcpy( class, full_path, full_path_len * sizeof(WCHAR) );
     wsprintfW( class + full_path_len, L"Win32_Process.Handle=\"%u\"", GetCurrentProcessId() );
     hr = IWbemServices_ExecMethod( services, class, method, 0, NULL, NULL, &out, NULL );
@@ -975,6 +1104,7 @@ static void test_Win32_SystemEnclosure( IWbemServices *services )
     check_property( obj, L"LockPresent", VT_BOOL, CIM_BOOLEAN );
     check_property( obj, L"Manufacturer", VT_BSTR, CIM_STRING );
     check_property( obj, L"Name", VT_BSTR, CIM_STRING );
+    check_property( obj, L"SerialNumber", VT_BSTR, CIM_STRING );
     check_property( obj, L"Tag", VT_BSTR, CIM_STRING );
 
     IWbemClassObject_Release( obj );
@@ -1535,6 +1665,7 @@ static void test_Win32_NetworkAdapterConfiguration( IWbemServices *services )
         check_property( obj, L"Index", VT_I4, CIM_UINT32 );
         check_property( obj, L"IPEnabled", VT_BOOL, CIM_BOOLEAN );
         check_property_nullable( obj, L"DNSDomain", VT_BSTR, CIM_STRING );
+        check_ip_address_order( obj );
 
         IWbemClassObject_Release( obj );
     }
@@ -1812,6 +1943,7 @@ static void test_Win32_Processor( IWbemServices *services )
         check_property_nullable( obj, L"Name", VT_BSTR, CIM_STRING );
         check_property_nullable( obj, L"ProcessorId", VT_BSTR, CIM_STRING );
         check_property_nullable( obj, L"Revision", VT_I4, CIM_UINT16 );
+        check_property( obj, L"Status", VT_BSTR, CIM_STRING );
         check_property( obj, L"Version", VT_BSTR, CIM_STRING );
 
         type = 0xdeadbeef;
@@ -1914,6 +2046,7 @@ static void test_Win32_VideoController( IWbemServices *services )
         check_property( obj, L"DriverDate", VT_BSTR, CIM_DATETIME );
         check_property( obj, L"DriverVersion", VT_BSTR, CIM_STRING );
         check_property_nullable( obj, L"InstalledDisplayDrivers", VT_BSTR, CIM_STRING );
+        check_property( obj, L"PNPDeviceID", VT_BSTR, CIM_STRING );
         check_property( obj, L"Status", VT_BSTR, CIM_STRING );
 
         IWbemClassObject_Release( obj );
@@ -2542,6 +2675,19 @@ static void test_MSFT_PhysicalDisk( IWbemLocator *locator )
     SysFreeString( query );
 }
 
+static void test_SecurityCenter2( IWbemLocator *locator )
+{
+    BSTR path = SysAllocString( L"ROOT\\SecurityCenter2" );
+    IWbemServices *services;
+    HRESULT hr;
+
+    hr = IWbemLocator_ConnectServer( locator, path, NULL, NULL, NULL, 0, NULL, NULL, &services );
+    ok( hr == S_OK, "failed to get IWbemServices interface %#lx\n", hr );
+
+    IWbemServices_Release( services );
+    SysFreeString( path );
+}
+
 START_TEST(query)
 {
     BSTR path = SysAllocString( L"ROOT\\CIMV2" );
@@ -2630,6 +2776,7 @@ START_TEST(query)
     test_empty_namespace( locator );
     test_MSSMBios_RawSMBiosTables( locator );
     test_MSFT_PhysicalDisk( locator );
+    test_SecurityCenter2( locator );
 
     SysFreeString( path );
     IWbemServices_Release( services );

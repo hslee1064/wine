@@ -25,7 +25,6 @@
 #include <stdarg.h>
 
 #include "ntstatus.h"
-#define WIN32_NO_STATUS
 #include "windef.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -40,13 +39,14 @@ WINE_DECLARE_DEBUG_CHANNEL(threadname);
 
 typedef struct
 {
-    struct list                 entry;
-    PVECTORED_EXCEPTION_HANDLER func;
-    ULONG                       count;
+    LIST_ENTRY                   entry;
+    ULONG_PTR                   *count;
+    void                        *unknown;
+    PVECTORED_EXCEPTION_HANDLER *func;
 } VECTORED_HANDLER;
 
-static struct list vectored_exception_handlers = LIST_INIT(vectored_exception_handlers);
-static struct list vectored_continue_handlers  = LIST_INIT(vectored_continue_handlers);
+static LIST_ENTRY vectored_exception_handlers = { &vectored_exception_handlers, &vectored_exception_handlers };
+static LIST_ENTRY vectored_continue_handlers  = { &vectored_continue_handlers, &vectored_continue_handlers };
 
 static RTL_CRITICAL_SECTION vectored_handlers_section;
 static RTL_CRITICAL_SECTION_DEBUG critsect_debug =
@@ -99,35 +99,37 @@ static const char *debugstr_exception_code( DWORD code )
 }
 
 
-static VECTORED_HANDLER *add_vectored_handler( struct list *handler_list, ULONG first,
+static VECTORED_HANDLER *add_vectored_handler( LIST_ENTRY *handler_list, ULONG first,
                                                PVECTORED_EXCEPTION_HANDLER func )
 {
-    VECTORED_HANDLER *handler = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*handler) );
+    VECTORED_HANDLER *handler = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*handler) + sizeof(*handler->count) );
     if (handler)
     {
         handler->func = RtlEncodePointer( func );
-        handler->count = 1;
+        handler->count = (ULONG_PTR *)(handler + 1);
+        *handler->count = 1;
         RtlEnterCriticalSection( &vectored_handlers_section );
-        if (first) list_add_head( handler_list, &handler->entry );
-        else list_add_tail( handler_list, &handler->entry );
+        if (first) InsertHeadList( handler_list, &handler->entry );
+        else InsertTailList( handler_list, &handler->entry );
         RtlLeaveCriticalSection( &vectored_handlers_section );
     }
     return handler;
 }
 
 
-static ULONG remove_vectored_handler( struct list *handler_list, VECTORED_HANDLER *handler )
+static ULONG remove_vectored_handler( LIST_ENTRY *handler_list, VECTORED_HANDLER *handler )
 {
-    struct list *ptr;
+    PLIST_ENTRY mark, entry;
     ULONG ret = FALSE;
 
     RtlEnterCriticalSection( &vectored_handlers_section );
-    LIST_FOR_EACH( ptr, handler_list )
+    mark = handler_list;
+    for (entry = mark->Flink; entry != mark; entry = entry->Flink)
     {
-        VECTORED_HANDLER *curr_handler = LIST_ENTRY( ptr, VECTORED_HANDLER, entry );
+        VECTORED_HANDLER *curr_handler = CONTAINING_RECORD( entry, VECTORED_HANDLER, entry );
         if (curr_handler == handler)
         {
-            if (!--curr_handler->count) list_remove( ptr );
+            if (!--*curr_handler->count) RemoveEntryList( entry );
             else handler = NULL;  /* don't free it yet */
             ret = TRUE;
             break;
@@ -138,6 +140,49 @@ static ULONG remove_vectored_handler( struct list *handler_list, VECTORED_HANDLE
     return ret;
 }
 
+#if defined(__x86_64__) && !defined(__arm64ec__)
+/*
+ * Some vectored exception handlers restore nonvolatile registers before
+ * returning. Preserve the caller state across the callback.
+ */
+extern LONG WINAPI call_vectored_handler( EXCEPTION_POINTERS *ptr, PVECTORED_EXCEPTION_HANDLER func );
+__ASM_GLOBAL_FUNC( call_vectored_handler,
+                    "pushq %rbx\n\t"
+                    __ASM_SEH(".seh_pushreg %rbx\n\t")
+                    "pushq %rsi\n\t"
+                    __ASM_SEH(".seh_pushreg %rsi\n\t")
+                    "pushq %rdi\n\t"
+                    __ASM_SEH(".seh_pushreg %rdi\n\t")
+                    "pushq %rbp\n\t"
+                    __ASM_SEH(".seh_pushreg %rbp\n\t")
+                    "pushq %r12\n\t"
+                    __ASM_SEH(".seh_pushreg %r12\n\t")
+                    "pushq %r13\n\t"
+                    __ASM_SEH(".seh_pushreg %r13\n\t")
+                    "pushq %r14\n\t"
+                    __ASM_SEH(".seh_pushreg %r14\n\t")
+                    "pushq %r15\n\t"
+                    __ASM_SEH(".seh_pushreg %r15\n\t")
+                    "subq $0x28,%rsp\n\t"
+                    __ASM_SEH(".seh_stackalloc 0x28\n\t")
+                    __ASM_SEH(".seh_endprologue\n\t")
+                    "callq *%rdx\n\t"
+                    "addq $0x28,%rsp\n\t"
+                    "popq %r15\n\t"
+                    "popq %r14\n\t"
+                    "popq %r13\n\t"
+                    "popq %r12\n\t"
+                    "popq %rbp\n\t"
+                    "popq %rdi\n\t"
+                    "popq %rsi\n\t"
+                    "popq %rbx\n\t"
+                    "ret" )
+#else
+static inline LONG call_vectored_handler( EXCEPTION_POINTERS *ptr, PVECTORED_EXCEPTION_HANDLER func )
+{
+    return func( ptr );
+}
+#endif
 
 /**********************************************************************
  *           call_vectored_handlers
@@ -146,21 +191,23 @@ static ULONG remove_vectored_handler( struct list *handler_list, VECTORED_HANDLE
  */
 static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 {
-    struct list *ptr;
     LONG ret = EXCEPTION_CONTINUE_SEARCH;
     EXCEPTION_POINTERS except_ptrs;
     PVECTORED_EXCEPTION_HANDLER func;
     VECTORED_HANDLER *handler, *to_free = NULL;
+    PLIST_ENTRY mark, entry;
 
     except_ptrs.ExceptionRecord = rec;
     except_ptrs.ContextRecord = context;
 
     RtlEnterCriticalSection( &vectored_handlers_section );
-    ptr = list_head( &vectored_exception_handlers );
-    while (ptr)
+
+    mark = &vectored_exception_handlers;
+    entry = mark->Flink;
+    while (entry != mark)
     {
-        handler = LIST_ENTRY( ptr, VECTORED_HANDLER, entry );
-        handler->count++;
+        handler = CONTAINING_RECORD( entry, VECTORED_HANDLER, entry );
+        ++*handler->count;
         func = RtlDecodePointer( handler->func );
         RtlLeaveCriticalSection( &vectored_handlers_section );
         RtlFreeHeap( GetProcessHeap(), 0, to_free );
@@ -168,14 +215,14 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 
         TRACE( "calling handler at %p code=%lx flags=%lx\n",
                func, rec->ExceptionCode, rec->ExceptionFlags );
-        ret = func( &except_ptrs );
+        ret = call_vectored_handler( &except_ptrs, func );
         TRACE( "handler at %p returned %lx\n", func, ret );
 
         RtlEnterCriticalSection( &vectored_handlers_section );
-        ptr = list_next( &vectored_exception_handlers, ptr );
-        if (!--handler->count)  /* removed during execution */
+        entry = entry->Flink;
+        if (!--*handler->count)  /* removed during execution */
         {
-            list_remove( &handler->entry );
+            RemoveEntryList( &handler->entry );
             to_free = handler;
         }
         if (ret == EXCEPTION_CONTINUE_EXECUTION) break;
@@ -185,6 +232,25 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
     return ret;
 }
 
+
+static const char *debugstr_addr( const void *addr )
+{
+    void *buffer[128];
+    MEMORY_SECTION_NAME *name = (MEMORY_SECTION_NAME *)buffer;
+    MEMORY_IMAGE_INFORMATION info;
+
+    if (!NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryImageInformation,
+                               &info, sizeof(info), NULL ) &&
+        !NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryMappedFilenameInformation,
+                               name, sizeof(buffer), NULL ))
+    {
+        WCHAR *p = wcsrchr( name->SectionFileName.Buffer, '\\' );
+        if (!p) p = name->SectionFileName.Buffer;
+        else p++;
+        return wine_dbg_sprintf( "%p (%ls+%08Ix)", addr, p, (char *)addr - (char *)info.ImageBase );
+    }
+    return wine_dbg_sprintf( "%p", addr );
+}
 
 /*******************************************************************
  *		dispatch_exception
@@ -198,12 +264,12 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
     {
     case EXCEPTION_WINE_STUB:
         if (rec->ExceptionInformation[1] >> 16)
-            MESSAGE( "wine: Call from %p to unimplemented function %s.%s, aborting\n",
-                     rec->ExceptionAddress,
+            MESSAGE( "wine: Call from %s to unimplemented function %s.%s, aborting\n",
+                     debugstr_addr( rec->ExceptionAddress ),
                      (char *)rec->ExceptionInformation[0], (char *)rec->ExceptionInformation[1] );
         else
-            MESSAGE( "wine: Call from %p to unimplemented function %s.%u, aborting\n",
-                     rec->ExceptionAddress,
+            MESSAGE( "wine: Call from %s to unimplemented function %s.%u, aborting\n",
+                     debugstr_addr( rec->ExceptionAddress ),
                      (char *)rec->ExceptionInformation[0], (USHORT)rec->ExceptionInformation[1] );
         break;
 
@@ -239,9 +305,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         break;
     }
 
-    TRACE( "code=%lx (%s) flags=%lx addr=%p\n",
+    TRACE( "code=%lx (%s) flags=%lx addr=%s\n",
            rec->ExceptionCode, debugstr_exception_code(rec->ExceptionCode),
-           rec->ExceptionFlags, rec->ExceptionAddress );
+           rec->ExceptionFlags, debugstr_addr( rec->ExceptionAddress ));
     for (i = 0; i < min( EXCEPTION_MAXIMUM_PARAMETERS, rec->NumberParameters ); i++)
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
@@ -534,14 +600,6 @@ void WINAPI RtlGetCallersAddress( void **caller, void **parent )
     *parent = count > 1 ? buffer[1] : NULL;
 }
 
-
-/**********************************************************************
- *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
- */
-ULONG64 WINAPI RtlGetEnabledExtendedFeatures(ULONG64 feature_mask)
-{
-    return user_shared_data->XState.EnabledFeatures & feature_mask;
-}
 
 struct context_copy_range
 {
@@ -976,9 +1034,6 @@ NTSTATUS WINAPI RtlCopyExtendedContext( CONTEXT_EX *dst, ULONG context_flags, CO
     dst_xs->Mask = (src_xs->Mask & ~(ULONG64)3) & feature_mask;
     dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled
             ? ((ULONG64)1 << 63) | (src_xs->CompactionMask & feature_mask) : 0;
-
-
-    if (dst_xs->CompactionMask) feature_mask &= dst_xs->CompactionMask;
     feature_mask = dst_xs->Mask >> 2;
 
     i = 2;

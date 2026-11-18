@@ -95,7 +95,7 @@ static const IMAGE_NT_HEADERS32 *get_nt_header( void )
     if (!dos) return NULL;
     is_builtin = (dos->e_lfanew >= sizeof(*dos) + 32 &&
                   !memcmp( dos + 1, builtin_signature, sizeof(builtin_signature) ));
-    return PRD(dos->e_lfanew, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
+    return PRD((ULONG)dos->e_lfanew, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
 }
 
 void print_fake_dll( void )
@@ -195,9 +195,9 @@ static inline const char *longlong_str( ULONGLONG value )
     static char buffer[20];
 
     if (sizeof(value) > sizeof(unsigned long) && value >> 32)
-        sprintf(buffer, "%lx%08lx", (unsigned long)(value >> 32), (unsigned long)value);
+        snprintf(buffer, sizeof(buffer), "%lx%08lx", (unsigned long)(value >> 32), (unsigned long)value);
     else
-        sprintf(buffer, "%lx", (unsigned long)value);
+        snprintf(buffer, sizeof(buffer), "%lx", (unsigned long)value);
     return buffer;
 }
 
@@ -1598,9 +1598,9 @@ static void dump_armnt_unwind_info( const struct runtime_function_armnt *fnc )
                     last = 3;
             }
             if (first == last)
-                sprintf(intregs, "r%u", first);
+                snprintf(intregs, sizeof(intregs), "r%u", first);
             else
-                sprintf(intregs, "r%u-r%u", first, last);
+                snprintf(intregs, sizeof(intregs), "r%u-r%u", first, last);
             fpoffset = last + 1 - first;
         }
 
@@ -1614,9 +1614,9 @@ static void dump_armnt_unwind_info( const struct runtime_function_armnt *fnc )
                     last = 3;
             }
             if (first == last)
-                sprintf(intregspop, "r%u", first);
+                snprintf(intregspop, sizeof(intregspop), "r%u", first);
             else
-                sprintf(intregspop, "r%u-r%u", first, last);
+                snprintf(intregspop, sizeof(intregspop), "r%u-r%u", first, last);
         }
 
         if (fnc->C)
@@ -1645,7 +1645,7 @@ static void dump_armnt_unwind_info( const struct runtime_function_armnt *fnc )
         if (fnc->R)
         {
             if (fnc->Reg)
-                sprintf(vfpregs, "d8-d%u", fnc->Reg + 8);
+                snprintf(vfpregs, sizeof(vfpregs), "d8-d%u", fnc->Reg + 8);
             else
                 strcpy(vfpregs, "d8");
         }
@@ -2910,7 +2910,6 @@ static void print_clr( const char *str )
 static void print_clr_strings( const BYTE *data, UINT data_size )
 {
     const char *beg = (const char *)data, *end;
-    UINT count = 0;
 
     if (!data_size) return;
     clr_indent += 4;
@@ -2918,9 +2917,8 @@ static void print_clr_strings( const BYTE *data, UINT data_size )
     {
         if (!(end = memchr( beg, '\0', data_size - (beg - (const char *)data) ))) break;
         print_clr_indent();
-        printf( "%-10u\"%s\"\n", count, beg );
+        printf( "%-10u\"%s\"\n", (UINT)(beg - (const char *)data), beg );
         beg = end + 1;
-        count++;
     }
     clr_indent -= 4;
 }
@@ -4127,7 +4125,7 @@ static void print_clr_stream( const BYTE *base, const BYTE **ptr, UINT *size )
         guids.data = base + stream_offset;
         guids.size = stream_size;
     }
-    else if (!strcmp( name, "#~" ))
+    else if (!strcmp( name, "#~" ) || !strcmp (name, "#-" ))
     {
         tables.data = base + stream_offset;
         tables.size = stream_size;
@@ -4163,7 +4161,7 @@ static void print_clr_metadata( const BYTE *data, UINT data_size )
     version = (const char *)ptr;
     print_clr( "Version      " );
     printf( "%s\n", version );
-    len = ((strlen( version ) + 1) + 3) & ~3;
+    len = (len + 3) & ~3;
     if (size < len) return;
     ptr += len; size -= len;
 
@@ -5139,7 +5137,7 @@ enum FileSig get_kind_exec(void)
     if ((dh = PRD(0, sizeof(IMAGE_DOS_HEADER))))
     {
         /* the signature is the first DWORD */
-        pdw = PRD(dh->e_lfanew, sizeof(DWORD));
+        pdw = PRD((ULONG)dh->e_lfanew, sizeof(DWORD));
         if (pdw)
         {
             if (*pdw == IMAGE_NT_SIGNATURE)                     return SIG_PE;
@@ -5300,7 +5298,7 @@ static	void	do_grab_sym( void )
 	{
 	    char ordinal_text[256];
 	    /* Ordinal only entry */
-            sprintf (ordinal_text, "%s_%u",
+            snprintf (ordinal_text, sizeof(ordinal_text), "%s_%u",
 		      globals.forward_dll ? globals.forward_dll : OUTPUT_UC_DLL_NAME,
                       (UINT)exportDir->Base + i);
 	    str_toupper(ordinal_text);

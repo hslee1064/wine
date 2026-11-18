@@ -118,7 +118,7 @@ static BOOL WINAPI init_trash_dirs( INIT_ONCE *once, void *param, void **context
         swprintf( files, len, fmt, home );
         files[1] = '\\';  /* change \??\ to \\?\ */
         for (p = files; *p; p++) if (*p == '/') *p = '\\';
-        CreateDirectoryW( files, NULL );
+        SHCreateDirectoryExW( NULL, files, NULL );
         info = malloc( len * sizeof(WCHAR) );
         lstrcpyW( info, files );
         lstrcatW( files, L"\\files" );
@@ -1247,10 +1247,6 @@ HRESULT WINAPI SHEmptyRecycleBinA(HWND hwnd, LPCSTR pszRootPath, DWORD dwFlags)
     MultiByteToWideChar(CP_ACP, 0, pszRootPath, -1, wszRootPath, MAX_PATH);
     return SHEmptyRecycleBinW(hwnd, wszRootPath, dwFlags);
 }
-
-#define SHERB_NOCONFIRMATION 1
-#define SHERB_NOPROGRESSUI   2
-#define SHERB_NOSOUND        4
 
 HRESULT WINAPI SHEmptyRecycleBinW(HWND hwnd, LPCWSTR pszRootPath, DWORD dwFlags)
 {

@@ -1256,6 +1256,7 @@ static BOOL wined3d_context_gl_set_gl_context(struct wined3d_context_gl *context
         TRACE("Using backup DC %p.\n", context_gl->dc);
         context_gl->dc_is_private = TRUE;
         context_gl->dc_has_format = FALSE;
+        context_gl->internal_format_set = FALSE;
 
         if (!wined3d_context_gl_set_pixel_format(context_gl))
         {
@@ -1700,7 +1701,7 @@ static int context_choose_pixel_format(const struct wined3d_device *device, HDC 
 
         if (value > current_value)
         {
-            iPixelFormat = cfg->iPixelFormat;
+            iPixelFormat = i + 1;
             current_value = value;
         }
     }
@@ -2205,7 +2206,7 @@ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wi
     {
         GL_EXTCALL(glProvokingVertexEXT(GL_FIRST_VERTEX_CONVENTION_EXT));
     }
-    if (!(d3d_info->wined3d_creation_flags & WINED3D_NO_PRIMITIVE_RESTART))
+    if (!(d3d_info->wined3d_creation_flags & WINED3D_LEGACY))
     {
         if (gl_info->supported[ARB_ES3_COMPATIBILITY])
         {
@@ -2217,8 +2218,7 @@ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wi
             FIXME("OpenGL implementation does not support GL_PRIMITIVE_RESTART_FIXED_INDEX.\n");
         }
     }
-    if (!(d3d_info->wined3d_creation_flags & WINED3D_LEGACY_CUBEMAP_FILTERING)
-            && gl_info->supported[ARB_SEAMLESS_CUBE_MAP])
+    if (!(d3d_info->wined3d_creation_flags & WINED3D_LEGACY) && gl_info->supported[ARB_SEAMLESS_CUBE_MAP])
     {
         gl_info->gl_ops.gl.p_glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
         checkGLcall("enable seamless cube map filtering");

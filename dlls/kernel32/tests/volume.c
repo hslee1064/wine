@@ -661,6 +661,7 @@ static void test_disk_query_property(void)
     STORAGE_PROPERTY_QUERY query = {0};
     STORAGE_DESCRIPTOR_HEADER header = {0};
     STORAGE_DEVICE_DESCRIPTOR descriptor = {0};
+    DEVICE_TRIM_DESCRIPTOR trim_descriptor = {0};
     DEVICE_SEEK_PENALTY_DESCRIPTOR seek_pen = {0};
     HANDLE handle;
     DWORD error;
@@ -730,6 +731,34 @@ static void test_disk_query_property(void)
             ok(seek_pen.Size == sizeof(seek_pen), "got %ld\n", seek_pen.Size);
             ok(seek_pen.IncursSeekPenalty == TRUE || seek_pen.IncursSeekPenalty == FALSE, "got %d.\n", seek_pen.IncursSeekPenalty);
         }
+    }
+
+    /* Tests of StorageDeviceTrimProperty. */
+    query.PropertyId = StorageDeviceTrimProperty;
+    query.QueryType = PropertyStandardQuery;
+    SetLastError(0xdeadbeef);
+    ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &header,
+                          sizeof(header), &size, NULL);
+    error = GetLastError();
+    ok(!!ret, "expect ret %#x, got %#x\n", TRUE, ret);
+    ok(error == 0xdeadbeef, "expect err %#x, got err %#lx\n", 0xdeadbeef, error);
+    ok(size == sizeof(header), "got size %ld\n", size);
+    ok(header.Version == sizeof(trim_descriptor), "got header.Version %ld\n", header.Version);
+    ok(header.Size == sizeof(trim_descriptor), "got header.Size %ld\n", header.Size);
+
+    SetLastError(0xdeadbeef);
+    memset(&trim_descriptor, 0xcc, sizeof(trim_descriptor));
+    ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &trim_descriptor,
+                          sizeof(trim_descriptor), &size, NULL);
+    error = GetLastError();
+    ok(!!ret || broken(!ret && error == ERROR_INVALID_FUNCTION) /* Win8 */,
+       "expect ret %#x, got err %#lx\n", ret, error);
+    if (ret)
+    {
+        ok(error == 0xdeadbeef, "expect err %#x, got err %#lx\n", 0xdeadbeef, error);
+        ok(size == sizeof(trim_descriptor), "got size %ld\n", size);
+        ok(trim_descriptor.Version == sizeof(trim_descriptor), "got descriptor.Version %ld\n", trim_descriptor.Version);
+        ok(trim_descriptor.Size == sizeof(trim_descriptor), "got descriptor.Size %ld\n", trim_descriptor.Size);
     }
 
     CloseHandle(handle);
@@ -914,7 +943,7 @@ static void test_GetVolumePathNameA(void)
         if (ret)
         {
             ok(!strcmp( volume_path, test_paths[i].path_name )
-                    || broken(!strcasecmp( volume_path, test_paths[i].path_name )), /* XP */
+                    || broken(!stricmp( volume_path, test_paths[i].path_name )), /* XP */
                     "GetVolumePathName test %d unexpectedly returned path %s (expected %s).\n",
                     i, volume_path, test_paths[i].path_name);
         }
@@ -1328,7 +1357,7 @@ static void test_scsi_pass_through(HANDLE device)
     trace("size %lu, sense %lu+%u, data %lu+%lu\n",
             size, buf.packet.SenseInfoOffset, buf.packet.SenseInfoLength,
             (DWORD)buf.packet.DataBufferOffset, buf.packet.DataTransferLength);
-    todo_wine ok(size == (DWORD)buf.packet.DataBufferOffset + buf.packet.DataTransferLength, "unexpected size %lu\n", size);
+    ok(size == (DWORD)buf.packet.DataBufferOffset + buf.packet.DataTransferLength, "unexpected size %lu\n", size);
 
     ok((buf.data[0] & 0x1f) == READ_ONLY_DIRECT_ACCESS_DEVICE, "unexpected device type %d\n", buf.data[0] & 0x1f);
     ok(buf.packet.Length == sizeof(SCSI_PASS_THROUGH), "got Length %u\n", buf.packet.Length);
@@ -1378,7 +1407,7 @@ static void test_scsi_pass_through(HANDLE device)
     trace("size %lu, sense %lu+%u, data %lu+%lu\n",
             size, buf.packet.SenseInfoOffset, buf.packet.SenseInfoLength,
             (DWORD)buf.packet.DataBufferOffset, buf.packet.DataTransferLength);
-    todo_wine ok(size == (DWORD)buf.packet.DataBufferOffset + buf.packet.DataTransferLength, "unexpected size %lu\n", size);
+    ok(size == (DWORD)buf.packet.DataBufferOffset + buf.packet.DataTransferLength, "unexpected size %lu\n", size);
 
     ok((buf.data[0] & 0x1f) == READ_ONLY_DIRECT_ACCESS_DEVICE, "unexpected device type %d\n", buf.data[0] & 0x1f);
     ok(buf.packet.Length == sizeof(SCSI_PASS_THROUGH), "got Length %u\n", buf.packet.Length);
@@ -1413,9 +1442,9 @@ static void test_scsi_pass_through(HANDLE device)
             size, buf.packet.SenseInfoOffset, buf.packet.SenseInfoLength,
             (DWORD)buf.packet.DataBufferOffset, buf.packet.DataTransferLength);
     if (buf.packet.DataTransferLength)
-        todo_wine ok(size == (DWORD)buf.packet.DataBufferOffset + buf.packet.DataTransferLength, "unexpected size %lu\n", size);
+        ok(size == (DWORD)buf.packet.DataBufferOffset + buf.packet.DataTransferLength, "unexpected size %lu\n", size);
     else
-        todo_wine ok(size == (DWORD)buf.packet.DataBufferOffset || size == buf.packet.SenseInfoOffset + buf.packet.SenseInfoLength, "unexpected size %lu\n", size);
+        ok(size == (DWORD)buf.packet.DataBufferOffset || size == buf.packet.SenseInfoOffset + buf.packet.SenseInfoLength, "unexpected size %lu\n", size);
 
     ok(buf.packet.Length == sizeof(SCSI_PASS_THROUGH), "got Length %u\n", buf.packet.Length);
     ok(buf.packet.ScsiStatus == SCSISTAT_CHECK_CONDITION, "got ScsiStatus %d\n", buf.packet.ScsiStatus);
@@ -1551,7 +1580,7 @@ static void test_scsi_pass_through_direct(HANDLE device)
 
     trace("size %lu, sense %lu+%u, data %lu\n",
             size, buf.packet.SenseInfoOffset, buf.packet.SenseInfoLength, buf.packet.DataTransferLength);
-    todo_wine ok(size == buf.packet.SenseInfoOffset + buf.packet.SenseInfoLength, "unexpected size %lu\n", size);
+    ok(size == buf.packet.SenseInfoOffset + buf.packet.SenseInfoLength, "unexpected size %lu\n", size);
 
     ok(buf.packet.Length == sizeof(SCSI_PASS_THROUGH_DIRECT), "got Length %u\n", buf.packet.Length);
     ok(buf.packet.ScsiStatus == SCSISTAT_CHECK_CONDITION, "got ScsiStatus %d\n", buf.packet.ScsiStatus);
@@ -1990,6 +2019,8 @@ static void test_GetVolumeInformationByHandle(void)
     ret = pGetVolumeInformationByHandleW( file, label, ARRAY_SIZE(label), &serial,
             &filename_len, &flags, fsname, ARRAY_SIZE(fsname) );
     ok(ret, "got error %lu\n", GetLastError());
+    ok(flags & FILE_SUPPORTS_OPEN_BY_FILE_ID,
+            "expected FILE_SUPPORTS_OPEN_BY_FILE_ID to be set, got %#lx\n", flags);
 
     memset(buffer, 0, sizeof(buffer));
     status = NtQueryVolumeInformationFile( file, &io, buffer, sizeof(buffer), FileFsVolumeInformation );
@@ -2149,6 +2180,7 @@ static void check_disk_space_information_(unsigned int line, const DISK_SPACE_IN
 static void test_GetDiskSpaceInformationA(void)
 {
     DISK_SPACE_INFORMATION info;
+    char volume[MAX_PATH];
     HRESULT hr;
 
     /* GetDiskSpaceInformation() is supported on Windows 10 build 1809 and later */
@@ -2176,12 +2208,18 @@ static void test_GetDiskSpaceInformationA(void)
     ok(hr == S_OK, "failed 0x%08lx\n", hr);
     check_disk_space_information(&info);
 
-    hr = pGetDiskSpaceInformationA("C:\\", &info);
+    hr = pGetDiskSpaceInformationA("C:\\windows\\", &info);
     ok(hr == S_OK, "failed 0x%08lx\n", hr);
     check_disk_space_information(&info);
 
     hr = pGetDiskSpaceInformationA("\\\\?\\C:\\", &info);
     ok(hr == S_OK, "failed 0x%08lx\n", hr);
+    check_disk_space_information(&info);
+
+    GetVolumeNameForVolumeMountPointA("C:\\", volume, ARRAY_SIZE(volume));
+
+    hr = pGetDiskSpaceInformationA(volume, &info);
+    ok(hr == S_OK, "got %#lx for %s\n", hr, debugstr_a(volume));
     check_disk_space_information(&info);
 }
 
