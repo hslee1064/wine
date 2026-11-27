@@ -18,10 +18,15 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#define COBJMACROS
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "waylanddrv_dll.h"
 
 #include "ntuser.h"
 #include "winuser.h"
+#include "objbase.h"
+#include "wincodec.h"
 
 #include "wine/debug.h"
 
@@ -38,13 +43,115 @@ static DWORD WINAPI wayland_read_events_thread(void *arg)
     return 0;
 }
 
+/* Decode encoded image data (PNG, BMP, ...) to a packed 32bpp bottom-up DIB. */
+static HGLOBAL decode_image_to_dib(const void *data, UINT size)
+{
+    IWICImagingFactory *factory = NULL;
+    IWICStream *stream = NULL;
+    IWICBitmapDecoder *decoder = NULL;
+    IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapSource *source = NULL;
+    BITMAPINFOHEADER *bmi;
+    HGLOBAL ret = NULL;
+    UINT width, height, stride, y;
+    BYTE *bits;
+    HRESULT hr;
+
+    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IWICImagingFactory, (void **)&factory);
+    if (SUCCEEDED(hr)) hr = IWICImagingFactory_CreateStream(factory, &stream);
+    if (SUCCEEDED(hr)) hr = IWICStream_InitializeFromMemory(stream, (BYTE *)data, size);
+    if (SUCCEEDED(hr))
+        hr = IWICImagingFactory_CreateDecoderFromStream(factory, (IStream *)stream, NULL,
+                                                        WICDecodeMetadataCacheOnDemand, &decoder);
+    if (SUCCEEDED(hr)) hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    if (SUCCEEDED(hr))
+        hr = WICConvertBitmapSource(&GUID_WICPixelFormat32bppBGRA, (IWICBitmapSource *)frame, &source);
+    if (SUCCEEDED(hr)) hr = IWICBitmapSource_GetSize(source, &width, &height);
+    if (FAILED(hr))
+    {
+        ERR("failed to decode clipboard image, hr %#lx\n", hr);
+        goto done;
+    }
+
+    stride = width * 4;
+    if (!width || !height || height > (0x7fffffff - sizeof(*bmi)) / stride) goto done;
+    if (!(ret = GlobalAlloc(GMEM_MOVEABLE, sizeof(*bmi) + stride * height))) goto done;
+
+    bmi = GlobalLock(ret);
+    memset(bmi, 0, sizeof(*bmi));
+    bmi->biSize = sizeof(*bmi);
+    bmi->biWidth = width;
+    bmi->biHeight = height;
+    bmi->biPlanes = 1;
+    bmi->biBitCount = 32;
+    bmi->biCompression = BI_RGB;
+    bmi->biSizeImage = stride * height;
+    bits = (BYTE *)(bmi + 1);
+
+    /* DIB rows are stored bottom-up. */
+    for (y = 0; y < height && SUCCEEDED(hr); y++)
+    {
+        WICRect rect = {0, y, width, 1};
+        hr = IWICBitmapSource_CopyPixels(source, &rect, stride, stride,
+                                         bits + (height - 1 - y) * stride);
+    }
+    GlobalUnlock(ret);
+    if (FAILED(hr))
+    {
+        ERR("failed to copy clipboard image pixels, hr %#lx\n", hr);
+        GlobalFree(ret);
+        ret = NULL;
+    }
+    else TRACE("decoded clipboard image %ux%u\n", width, height);
+
+done:
+    if (source) IWICBitmapSource_Release(source);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+    if (stream) IWICStream_Release(stream);
+    if (factory) IWICImagingFactory_Release(factory);
+    return ret;
+}
+
+static BOOL render_clipboard_dib(void)
+{
+    struct waylanddrv_clipboard_import_image_params params = {0};
+    HGLOBAL dib = NULL;
+    void *data = NULL;
+    NTSTATUS status;
+
+    while ((status = WAYLANDDRV_UNIX_CALL(clipboard_import_image, &params)) == STATUS_BUFFER_TOO_SMALL)
+    {
+        free(data);
+        if (!(data = malloc(params.size))) return FALSE;
+        params.data = (UINT_PTR)data;
+    }
+
+    if (!status) dib = decode_image_to_dib(data, params.size);
+    free(data);
+
+    if (dib && !SetClipboardData(CF_DIB, dib))
+    {
+        GlobalFree(dib);
+        return FALSE;
+    }
+    return dib != NULL;
+}
+
 static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
+    case WM_RENDERFORMAT:
+        if (wp == CF_DIB)
+        {
+            render_clipboard_dib();
+            return 0;
+        }
+        return NtUserMessageCall(hwnd, msg, wp, lp, 0, NtUserClipboardWindowProc, FALSE);
     case WM_NCCREATE:
     case WM_CLIPBOARDUPDATE:
-    case WM_RENDERFORMAT:
     case WM_TIMER:
     case WM_DESTROYCLIPBOARD:
     case WM_USER:
@@ -89,7 +196,16 @@ static DWORD WINAPI clipboard_thread(void *arg)
 
     TRACE("created per-process clipboard window hwnd=%p\n", hwnd);
 
+    /* Needed to decode clipboard images with WIC. */
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
     while (GetMessageW(&msg, 0, 0, 0)) DispatchMessageW(&msg);
+    return 0;
+}
+
+static DWORD WINAPI systray_thread(void *arg)
+{
+    WAYLANDDRV_UNIX_CALL(systray_run, NULL);
     return 0;
 }
 
@@ -107,6 +223,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 
     /* Read wayland events from a dedicated thread. */
     CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
+    /* Dispatch D-Bus messages for tray icons, once there are some. */
+    CloseHandle(CreateThread(NULL, 0, systray_thread, NULL, 0, &tid));
     /* Handle clipboard events in a dedicated thread, if needed. */
     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));

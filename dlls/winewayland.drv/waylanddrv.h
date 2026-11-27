@@ -433,6 +433,10 @@ void wayland_text_input_deinit(void);
  */
 
 void wayland_data_device_init(void);
+NTSTATUS waylanddrv_unix_clipboard_import_image(void *arg);
+NTSTATUS waylanddrv_unix_systray_run(void *arg);
+LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data);
+void WAYLAND_CleanupIcons(HWND hwnd);
 
 /**********************************************************************
  *          Helpers

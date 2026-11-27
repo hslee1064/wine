@@ -27,8 +27,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "waylanddrv.h"
 #include "wine/debug.h"
 
@@ -498,6 +501,35 @@ static void data_control_device_data_offer(
     wayland_data_offer_create(zwlr_data_control_offer_v1);
 }
 
+/* Image mime types that can be decoded to CF_DIB, in order of preference. */
+static const char *image_mime_types[] = {"image/png", "image/bmp", "image/jpeg", "image/gif"};
+
+static const char *offer_image_mime_type(struct wayland_data_offer *data_offer)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(image_mime_types); i++)
+        if (string_array_contains(&data_offer->types, image_mime_types[i]))
+            return image_mime_types[i];
+    return NULL;
+}
+
+static struct wayland_data_offer *current_clipboard_offer(struct wayland_data_device *data_device)
+{
+    if (process_wayland.zwlr_data_control_manager_v1 &&
+        data_device->clipboard_zwlr_data_control_offer_v1)
+    {
+        return zwlr_data_control_offer_v1_get_user_data(
+            data_device->clipboard_zwlr_data_control_offer_v1);
+    }
+    if (!process_wayland.zwlr_data_control_manager_v1 &&
+        data_device->clipboard_wl_data_offer)
+    {
+        return wl_data_offer_get_user_data(data_device->clipboard_wl_data_offer);
+    }
+    return NULL;
+}
+
 static void handle_selection(struct wayland_data_device *data_device,
                              struct wayland_data_offer *data_offer)
 {
@@ -551,6 +583,18 @@ static void handle_selection(struct wayland_data_device *data_device,
                   *p, format->clipboard_format);
             NtUserSetClipboardData(format->clipboard_format, 0, &params);
         }
+    }
+
+    /* Most Windows applications only understand bitmap formats, so offer
+     * CF_DIB for image data; it is decoded on the PE side by the per-process
+     * clipboard window (see dllmain.c). */
+    if (!process_wayland.zwlr_data_control_manager_v1 &&
+        !string_array_contains(&data_offer->types, "image/bmp") &&
+        offer_image_mime_type(data_offer))
+    {
+        struct set_clipboard_params params = {0};
+        TRACE("available clipboard format CF_DIB from image data\n");
+        NtUserSetClipboardData(CF_DIB, 0, &params);
     }
 
     NtUserCloseClipboard();
@@ -853,17 +897,7 @@ static void render_format(UINT clipboard_format)
     TRACE("clipboard_format=%u\n", clipboard_format);
 
     pthread_mutex_lock(&data_device->mutex);
-    if (process_wayland.zwlr_data_control_manager_v1 &&
-        data_device->clipboard_zwlr_data_control_offer_v1)
-    {
-        data_offer = zwlr_data_control_offer_v1_get_user_data(
-            data_device->clipboard_zwlr_data_control_offer_v1);
-    }
-    else if (!process_wayland.zwlr_data_control_manager_v1 &&
-             data_device->clipboard_wl_data_offer)
-    {
-        data_offer = wl_data_offer_get_user_data(data_device->clipboard_wl_data_offer);
-    }
+    data_offer = current_clipboard_offer(data_device);
 
     if (data_offer &&
         (format = data_device_format_for_clipboard_format(clipboard_format,
@@ -883,6 +917,67 @@ static void render_format(UINT clipboard_format)
         }
         close(import_fd);
     }
+}
+
+/**********************************************************************
+ *          waylanddrv_unix_clipboard_import_image
+ *
+ * Read the encoded image data (PNG, BMP, ...) of the current clipboard offer,
+ * so that the PE side can decode it. If the buffer is too small, the data is
+ * kept and the required size returned with STATUS_BUFFER_TOO_SMALL.
+ */
+NTSTATUS waylanddrv_unix_clipboard_import_image(void *arg)
+{
+    static pthread_mutex_t image_mutex = PTHREAD_MUTEX_INITIALIZER;
+    static void *image_data;
+    static size_t image_size;
+    struct waylanddrv_clipboard_import_image_params *params = arg;
+    struct wayland_data_device *data_device = &process_wayland.data_device;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    pthread_mutex_lock(&image_mutex);
+
+    if (!image_data)
+    {
+        struct wayland_data_offer *data_offer;
+        const char *mime = NULL;
+        int import_fd = -1;
+
+        pthread_mutex_lock(&data_device->mutex);
+        if ((data_offer = current_clipboard_offer(data_device)) &&
+            (mime = offer_image_mime_type(data_offer)))
+            import_fd = wayland_data_offer_get_import_fd(data_offer, mime);
+        pthread_mutex_unlock(&data_device->mutex);
+
+        if (import_fd >= 0)
+        {
+            TRACE("importing %s\n", mime);
+            image_data = read_all(import_fd, &image_size);
+            close(import_fd);
+        }
+        if (!image_data)
+        {
+            status = STATUS_NOT_FOUND;
+            goto done;
+        }
+    }
+
+    if (!params->data || params->size < image_size)
+    {
+        params->size = image_size;
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+
+    memcpy((void *)(ULONG_PTR)params->data, image_data, image_size);
+    params->size = image_size;
+    free(image_data);
+    image_data = NULL;
+    image_size = 0;
+
+done:
+    pthread_mutex_unlock(&image_mutex);
+    return status;
 }
 
 static void destroy_clipboard(void)
